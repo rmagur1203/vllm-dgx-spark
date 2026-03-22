@@ -1,0 +1,111 @@
+--- a/csrc/quantization/fp4/nvfp4_utils.cuh	2026-03-16 18:19:19.391766851 -0400
++++ b/csrc/quantization/fp4/nvfp4_utils.cuh	2026-03-16 18:22:28.041320893 -0400
+@@ -36,6 +36,46 @@
+ 
+ namespace vllm {
+ 
++// ============================================================================
++// Software E2M1 conversion for SM121 (GB10) - no cvt.rn.satfinite.e2m1x2.f32
++// ============================================================================
++// E2M1 format: 1 sign + 2 exponent + 1 mantissa
++// Representable values: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives)
++// Uses round-to-nearest-even at midpoints, satfinite clamping to 6.0.
++// Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
++// ============================================================================
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++__device__ __forceinline__ uint8_t _sw_float_to_e2m1(float x) {
++  uint8_t sign = (uint8_t)((__float_as_uint(x) >> 28) & 8u);
++  float ax = fabsf(x);
++  uint8_t mag;
++  if      (ax <= 0.25f)  mag = 0;  // 0.0   (code 000)
++  else if (ax <  0.75f)  mag = 1;  // 0.5   (code 001)
++  else if (ax <= 1.25f)  mag = 2;  // 1.0   (code 010)
++  else if (ax <  1.75f)  mag = 3;  // 1.5   (code 011)
++  else if (ax <= 2.5f)   mag = 4;  // 2.0   (code 100)
++  else if (ax <  3.5f)   mag = 5;  // 3.0   (code 101)
++  else if (ax <= 5.0f)   mag = 6;  // 4.0   (code 110)
++  else                    mag = 7;  // 6.0   (code 111) - satfinite
++  return sign | mag;
++}
++
++__device__ __forceinline__ uint32_t _sw_fp32_vec8_to_e2m1_flat(
++    float f0, float f1, float f2, float f3,
++    float f4, float f5, float f6, float f7) {
++  uint32_t val = 0;
++  val |= (uint32_t)_sw_float_to_e2m1(f0);
++  val |= (uint32_t)_sw_float_to_e2m1(f1) << 4;
++  val |= (uint32_t)_sw_float_to_e2m1(f2) << 8;
++  val |= (uint32_t)_sw_float_to_e2m1(f3) << 12;
++  val |= (uint32_t)_sw_float_to_e2m1(f4) << 16;
++  val |= (uint32_t)_sw_float_to_e2m1(f5) << 20;
++  val |= (uint32_t)_sw_float_to_e2m1(f6) << 24;
++  val |= (uint32_t)_sw_float_to_e2m1(f7) << 28;
++  return val;
++}
++#endif  // __CUDA_ARCH__ == 1210
++
+ template <typename Int>
+ __host__ __device__ inline Int round_up(Int x, Int y) {
+   static_assert(std::is_integral_v<Int>,
+@@ -57,6 +97,11 @@
+ // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
+ inline __device__ uint32_t fp32_vec8_to_e2m1(float (&array)[8]) {
+   uint32_t val;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++  val = _sw_fp32_vec8_to_e2m1_flat(
++      array[0], array[1], array[2], array[3],
++      array[4], array[5], array[6], array[7]);
++#else
+   asm volatile(
+       "{\n"
+       ".reg .b8 byte0;\n"
+@@ -72,12 +117,18 @@
+       : "=r"(val)
+       : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
+         "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
++#endif
+   return val;
+ }
+ 
+ // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
+ __device__ __forceinline__ uint32_t fp32_vec8_to_e2m1(float2 (&array)[4]) {
+   uint32_t val;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++  val = _sw_fp32_vec8_to_e2m1_flat(
++      array[0].x, array[0].y, array[1].x, array[1].y,
++      array[2].x, array[2].y, array[3].x, array[3].y);
++#else
+   asm volatile(
+       "{\n"
+       ".reg .b8 byte0;\n"
+@@ -93,6 +144,7 @@
+       : "=r"(val)
+       : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
+         "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
++#endif
+   return val;
+ }
+ 
+@@ -104,6 +156,14 @@
+ 
+ __device__ __forceinline__ u32x2 fp32_vec16_to_e2m1(float2 (&array)[8]) {
+   u32x2 out;
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++  out.lo = _sw_fp32_vec8_to_e2m1_flat(
++      array[0].x, array[0].y, array[1].x, array[1].y,
++      array[2].x, array[2].y, array[3].x, array[3].y);
++  out.hi = _sw_fp32_vec8_to_e2m1_flat(
++      array[4].x, array[4].y, array[5].x, array[5].y,
++      array[6].x, array[6].y, array[7].x, array[7].y);
++#else
+   asm volatile(
+       "{\n"
+       ".reg .b8 b0;\n"
+@@ -130,6 +190,7 @@
+         "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y),
+         "f"(array[4].x), "f"(array[4].y), "f"(array[5].x), "f"(array[5].y),
+         "f"(array[6].x), "f"(array[6].y), "f"(array[7].x), "f"(array[7].y));
++#endif
+   return out;
+ }
+ 

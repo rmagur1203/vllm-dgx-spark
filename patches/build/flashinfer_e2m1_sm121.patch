@@ -1,0 +1,21 @@
+Remove SM121A and SM121F from CUDA_PTX_FP4FP6_CVT_ENABLED in CUTLASS float_subbyte.h.
+SM121 (GB10) has mma.e2m1 tensor cores but lacks cvt.rn.satfinite.e2m1x2.f32 PTX.
+This forces CUTLASS to use its software fallback for FP4 E2M1 conversions on SM121.
+Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
+
+--- a/3rdparty/cutlass/include/cutlass/float_subbyte.h
++++ b/3rdparty/cutlass/include/cutlass/float_subbyte.h
+@@ -46,13 +46,13 @@
+ #if (defined(CUTLASS_ARCH_MMA_SM100A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM101A_ENABLED) ||\
+      defined(CUTLASS_ARCH_MMA_SM103A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM110A_ENABLED) ||\
+-     defined(CUTLASS_ARCH_MMA_SM120A_ENABLED) || defined(CUTLASS_ARCH_MMA_SM121A_ENABLED))
++     defined(CUTLASS_ARCH_MMA_SM120A_ENABLED))  /* SM121A removed: no cvt.rn.satfinite.e2m1x2.f32 on GB10 */
+ #  define CUDA_PTX_FP4FP6_CVT_ENABLED 1
+ #endif
+
+ #if (defined(CUTLASS_ARCH_MMA_SM100F_ENABLED) || defined(CUTLASS_ARCH_MMA_SM101F_ENABLED) ||\
+      defined(CUTLASS_ARCH_MMA_SM103F_ENABLED) || defined(CUTLASS_ARCH_MMA_SM110F_ENABLED) ||\
+-     defined(CUTLASS_ARCH_MMA_SM120F_ENABLED) || defined(CUTLASS_ARCH_MMA_SM121F_ENABLED))
++     defined(CUTLASS_ARCH_MMA_SM120F_ENABLED))  /* SM121F removed: no cvt.rn.satfinite.e2m1x2.f32 on GB10 */
+ #  define CUDA_PTX_FP4FP6_CVT_ENABLED 1
+ #endif

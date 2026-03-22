@@ -1,0 +1,118 @@
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h
+index 5cd0b12..857c326 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_template_dispatch_tma_ws.h
+@@ -309,7 +309,10 @@ constexpr bool are_tile_shapes_supported_sm120() {
+   return (TileM == 128 && TileN == 128 && TileK == 128) ||
+          (TileM == 128 && TileN == 128 && TileK == 256) ||
+          (TileM == 128 && TileN == 256 && TileK == 128) ||
+-         (TileM == 256 && TileN == 128 && TileK == 128);
++         (TileM == 256 && TileN == 128 && TileK == 128) ||
++         (TileM == 128 && TileN == 128 && TileK == 64) ||
++         (TileM == 128 && TileN == 256 && TileK == 64) ||
++         (TileM == 256 && TileN == 128 && TileK == 64);
+ }
+ 
+ /*
+diff --git a/flashinfer/jit/gemm/cutlass/generate_kernels.py b/flashinfer/jit/gemm/cutlass/generate_kernels.py
+index a7d1959..6e9b94e 100644
+--- a/flashinfer/jit/gemm/cutlass/generate_kernels.py
++++ b/flashinfer/jit/gemm/cutlass/generate_kernels.py
+@@ -760,8 +760,11 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
+     quant_ops = [TrtLlm_QuantOp.none]
+     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
+     cta_shapes_mnk = [
++        [128, 128, 64],
+         [128, 128, 128],
+         [128, 128, 256],
++        [128, 256, 64],
++        [256, 128, 64],
+         [256, 128, 128],
+         [128, 256, 128],
+     ]
+@@ -809,7 +812,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
+ 
+         # Minimal filter: for mixed FP8xFP4 on SM120/SM121, only emit 128x128x128
+         if act_type == DataType.e4m3 and weight_type == e2m1:
+-            if cta_shape_mnk != [128, 128, 128]:
++            if cta_shape_mnk not in ([128, 128, 128], [128, 128, 64], [128, 256, 64], [256, 128, 64]):
+                 continue
+ 
+         otypes = [act_type]
+diff --git a/include/cute/atom/copy_traits_sm90_tma.hpp b/include/cute/atom/copy_traits_sm90_tma.hpp
+index 78ac598f..53663ea7 100644
+--- a/3rdparty/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp
++++ b/3rdparty/cutlass/include/cute/atom/copy_traits_sm90_tma.hpp
+@@ -874,8 +874,14 @@ fill_tma_gmem_shape_stride(Tensor<GEngine,GLayout>   const& gtensor,           /
+     if constexpr (tma_i_rank == 1) {
+       // Trivial contribution of this gmem mode to this tma mode
+       auto ej = unwrap(get<i>(tma_gbasis_stride));
+-      gmem_prob_shape[i]  = basis_get(ej, gmem_shape);
+-      gmem_prob_stride[i] = basis_get(ej, gmem_stride);
++      if constexpr (cute::is_constant<0, decltype(ej)>::value) {
++        // Zero-stride basis: broadcast dimension (e.g. SFVectorSize with K=64 folding)
++        gmem_prob_shape[i]  = 1;
++        gmem_prob_stride[i] = 0;
++      } else {
++        gmem_prob_shape[i]  = basis_get(ej, gmem_shape);
++        gmem_prob_stride[i] = basis_get(ej, gmem_stride);
++      }
+     } else {
+       // Apply a recurrence to each gmem mode that contributes to this tma mode
+       for_each(get<i>(tma_gbasis_stride), [&](auto ej) {
+diff --git a/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl b/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl
+index 99b1323a..05936613 100755
+--- a/3rdparty/cutlass/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl
++++ b/3rdparty/cutlass/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl
+@@ -180,28 +180,42 @@ struct CollectiveBuilder<
+   // A single indivisible block will hold 4 scale factors of 128 rows/columns (A/B matrix).
+   // 4 is chosen to make consecutive 32bits of data to have scale factors for only a single row (col). 32bits corresponds to the TMEM word size 
+   using Blk_MN    = typename Sm1xxBlkScaledConfig::Blk_MN;
+-  using Blk_SF    = typename Sm1xxBlkScaledConfig::Blk_SF; 
+-  using Blk_Elems = decltype(Blk_MN{} * Blk_SF{});
++  using Blk_SF    = typename Sm1xxBlkScaledConfig::Blk_SF;
++
++  // For tiles where K/SFVectorSize < Blk_SF (e.g. K=64 with SFVectorSize=32 gives only 2 SF
++  // values along K, but Blk_SF=4), clamp the effective block size to avoid TMA layout issues.
++  static constexpr int NumSFAlongK = size<2>(TileShape_MNK{}) / SFVectorSize;
++  using EffBlk_SF    = Int<(NumSFAlongK < Blk_SF{}) ? NumSFAlongK : int(Blk_SF{})>;
++  using EffBlk_Elems = decltype(Blk_MN{} * EffBlk_SF{});
++
++  // When EffBlk_SF < Blk_SF AND EffBlk_SF > MMA_NSF, fold into kBasicBlock to keep TMA flat.
++  static constexpr bool FoldSFIntoBasicBlock = (NumSFAlongK < Blk_SF{}) && (int(EffBlk_SF{}) > MMA_NSF);
+ 
+   // Basic storage block for new Scaling Factor Layouts
+   using mnBasicBlockShape  =  Shape<_32,_4>;
+   using mnBasicBlockStride = Stride<_16,_4>;
+-  using kBasicBlockShape  = Shape<Int<(int)SFVectorSize>, Int<MMA_NSF>>;
++  using kBasicBlockShape  = cute::conditional_t<FoldSFIntoBasicBlock,
++      Shape<Int<(int)SFVectorSize>, EffBlk_SF>,
++      Shape<Int<(int)SFVectorSize>, Int<MMA_NSF>>>;
+   using kBasicBlockStride = Stride<_0, _1>;
+-  
++
++  using OuterK0  = cute::conditional_t<FoldSFIntoBasicBlock, _1, decltype(EffBlk_SF{}/Int<MMA_NSF>{})>;
++  using OuterK1  = decltype(size<2>(TileShape_MNK{}) / Int<(int)SFVectorSize>{} / EffBlk_SF{});
++  using OuterKS0 = cute::conditional_t<FoldSFIntoBasicBlock, EffBlk_SF, Int<MMA_NSF>>;
++
+   using sSFA_shapeM       = decltype(prepend(size<0>(TileShape_MNK{}) / Blk_MN{},   mnBasicBlockShape{}));
+-  using sSF_strideMN      = decltype(prepend(                        Blk_Elems{},  mnBasicBlockStride{}));
++  using sSF_strideMN      = decltype(prepend(                      EffBlk_Elems{},  mnBasicBlockStride{}));
+   using sSFA_strideM      = sSF_strideMN;
+-  using sSF_shapeK        = decltype(prepend(make_shape( Blk_SF{}/Int<MMA_NSF>{},   size<2>(TileShape_MNK{}) / Int<(int)SFVectorSize>{} / Blk_SF{}),  kBasicBlockShape{}));
+-  
+-  using sSFA_strideK      = decltype(prepend(make_stride(         Int<MMA_NSF>{},   size<0>(TileShape_MNK{}) / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
++  using sSF_shapeK        = decltype(prepend(make_shape( OuterK0{},   OuterK1{}),  kBasicBlockShape{}));
++
++  using sSFA_strideK      = decltype(prepend(make_stride(         OuterKS0{},   size<0>(TileShape_MNK{}) / Blk_MN{} * EffBlk_Elems{}), kBasicBlockStride{}));
+   using sSFA_shape        = decltype(make_shape(  sSFA_shapeM{},   sSF_shapeK{}));
+   using sSFA_stride       = decltype(make_stride(sSFA_strideM{}, sSFA_strideK{}));
+   using SmemLayoutAtomSFA = decltype(make_layout(  sSFA_shape{},  sSFA_stride{}));
+ 
+   using sSFB_shapeN       = decltype(prepend(size<1>(TileShape_MNK{}) / Blk_MN{},   mnBasicBlockShape{}));
+   using sSFB_strideN      = sSF_strideMN;
+-  using sSFB_strideK      = decltype(prepend(make_stride(Int<MMA_NSF>{},   size<1>(TileShape_MNK{}) / Blk_MN{} * Blk_Elems{}), kBasicBlockStride{}));
++  using sSFB_strideK      = decltype(prepend(make_stride(OuterKS0{},   size<1>(TileShape_MNK{}) / Blk_MN{} * EffBlk_Elems{}), kBasicBlockStride{}));
+   using sSFB_shape        = decltype(make_shape(  sSFB_shapeN{},   sSF_shapeK{}));
+   using sSFB_stride       = decltype(make_stride(sSFB_strideN{}, sSFB_strideK{}));
+   using SmemLayoutAtomSFB = decltype(make_layout(  sSFB_shape{},  sSFB_stride{}));
