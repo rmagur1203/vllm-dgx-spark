@@ -860,8 +860,20 @@ echo always > /sys/kernel/mm/transparent_hugepage/defrag
 | — | — | (피크 21.8 counting, 19.5 일반) | 19.5~21.8 | — |
 | — | — | +CUDA_LAUNCH_BLOCKING=1 (Mamba workaround) | 8.8 | -56% (비채택) |
 | 9 | 미커밋 | MTP=2 (counting 27.0, essay 20.7) | **~22.1** | +12% |
-| — | — | **Baseline (12.0) 대비 총 개선** | — | **+84%** |
-| — | — | **최초 (2.5) 대비 총 개선** | — | **+784%** |
+| 10a | 미커밋 | CUTLASS alignas(1024)→alignas(128) | 39.9 (ShareGPT) | **+80%** ⭐ |
+| 10b | 미커밋 | + StageCount<4> 강제 | **48.9** (ShareGPT) | **+22%** ⭐ |
+| — | — | StageCount<3> 시도 | 46.15 | -6% (비채택) |
+| — | — | StageCount<2> 시도 | 40.05 / 71.00 | -18% (비채택) |
+| — | — | StageCount<5> 시도 | segfault | — |
+| — | — | 128×128×128B 타일 | segfault | — |
+| — | — | 256×128×64B 타일 | segfault | epilogue 64KB > SMEM |
+| — | — | --use_fast_math | 27.2 | -44% (비채택) |
+| — | — | SchedulerPipelineStageCount=2 | 40.76 | -17% (비채택) |
+| — | — | MTP=3 | 39.84 / 48.82 | -18% (비채택) |
+| — | — | MTP=1 + SC4 | 47.56 / 74.88 | concurrent만 우세 |
+| — | — | BTankut GB10 Triton config (K=256) | 39.96 | -18% (BF16에 부적합) |
+| — | — | **Baseline (12.0) 대비 총 개선** | — | **+308%** |
+| — | — | **최초 (2.5) 대비 총 개선** | — | **+1857%** |
 
 ---
 
