@@ -1317,17 +1317,144 @@ command:
 
 ---
 
-## 11. 요약
+---
+
+## 11. CUTLASS SMEM 최적화 (Phase 10, 03-23) ⭐
+
+144개 전수 벤치마크에서 Marlin이 FlashInfer CUTLASS보다 10~15% 빨랐던 근본 원인을 분석하고, CUTLASS 헤더를 직접 수정하여 **FlashInfer CUTLASS가 Marlin을 추월**하게 만들었습니다.
+
+### 근본 원인: CUTLASS SMEM alignment 낭비 + StageCountAutoCarveout 계산 오류
+
+`sm120_blockscaled_mma_array_tma.hpp`에서 `alignas(1024)`가 사용되어 SMEM alignment 낭비 발생. 또한 `StageCountAutoCarveout`가 epilogue/pipeline SharedStorage overhead를 고려하지 않아 stage 수를 과소 계산 (2 stages만 사용).
+
+### 적용한 CUTLASS 패치 4종
+
+| 파일 | 변경 | 효과 |
+|------|------|------|
+| `sm120_blockscaled_mma_array_tma.hpp` | `alignas(1024)` → `alignas(128)` | SMEM alignment 낭비 제거 |
+| `sm120_blockscaled_mma_builder.inl` | `ReducedSmemCapacityBytes` 정확한 계산 | 올바른 stage count |
+| `moe_gemm_tma_ws_launcher_patch.inl` | SM120에서 `StageCount<4>` 강제 | 4 pipeline stages (기존 2) |
+| `sm103_blockscaled_gemm_array_tma_warpspecialized.hpp` | `static_assert` sm100→sm120 | 컴파일 시 SMEM 체크 |
+
+### 성능 결과
+
+| 설정 | Single tok/s | 변화 |
+|------|-------------|------|
+| FlashInfer CUTLASS (패치 전) | 33.2 | baseline |
+| + alignas(128) 패치 | 39.9 | **+20%** |
+| + alignas(128) + StageCount<4> | **48.9** | **+47%** ⭐ |
+| Marlin (비교) | 46.3 | — |
+
+**FlashInfer CUTLASS가 최초로 Marlin을 추월: 48.9 > 46.3 tok/s (+5.6%)**
+
+### StageCount 스윕 결과
+
+| StageCount | Single tok/s | Max tok/s |
+|------------|-------------|-----------|
+| 2 | 40.05 | 71.00 |
+| 3 | 46.15 | 56.68 |
+| **4** | **48.9** | — |
+| 5 | segfault | — |
+
+### 시도했으나 실패한 CUTLASS 최적화
+
+| 시도 | 결과 | 원인 |
+|------|------|------|
+| **128×128×128B 타일** | segfault | epilogue 32KB + mainloop 72KB = 104KB > 101KB |
+| **256×128×64B 타일** | segfault | epilogue **64KB** (M×N×bf16 = 256×128×2) + mainloop 54KB = 118KB > 101KB |
+| **StageCount<5>** | segfault | mainloop 92KB + overhead > 101KB |
+| **--use_fast_math** | 27.2 tok/s (악화) | FP4 precision 깨져서 MTP acceptance 급락 |
+| **SchedulerPipelineStageCount=2** | 40.76 tok/s (악화) | scheduler pipeline 부족 |
+| **MTP=3** | 39.84 tok/s (악화) | 3번째 position acceptance 38.67% (너무 낮음) |
+| **MTP=1** | 47.56 / 74.88 tok/s | max throughput에서만 우세, single에서 열세 |
+
+> **참고:** [NVIDIA Forum — SM121 CUTLASS kernel optimization results](https://forums.developer.nvidia.com/t/sm121-cutlass-kernel-optimization-results-nvfp4-356-tflops-moe-grouped-gemm-on-dgx-spark/359960/2)
+> **참고:** [BTankut/dgx-spark-sglang-moe-configs](https://github.com/BTankut/dgx-spark-sglang-moe-configs) — GB10 MoE Triton config (FP8 GLM-4.7용, BF16에는 적용 불가)
+
+### CUTLASS 추가 최적화 분석 (opt2~7)
+
+| opt | 설명 | 상태 | 이유 |
+|-----|------|------|------|
+| opt2 | SF를 TMA barrier에서 분리 (dual-pipeline) | 코드 준비, 미적용 | PipelineTmaAsync에 dual-barrier 지원 필요 (CUTLASS 프레임워크 변경) |
+| opt3 | Grouped GEMM TensorMap overhead 축소 | 분석 완료 | TMA descriptor 512B (0.5% of SMEM) — 줄여도 무의미 |
+| opt4 | TMA → cp.async 전환 | 불가 | SM120 MMA ≠ SM100 UMMA, mainloop 전체 재작성 필요 |
+| opt5 | K-split accumulation | 불가 | Grouped GEMM TileScheduler가 K 분할 미지원, fused_moe가 routing+GEMM+activation 통합 |
+| opt6 | Expert prefetch to L2 | 커널 작동 확인 | Triton prefetch 커널 429 GB/s, MoE 통합은 C++ grouped GEMM 내부 수정 필요 |
+| opt7 | Warp-specialized 재설계 (cp.async 동기식) | 1249줄 작성 | `sm121_sync_mma_array.hpp` 작성 완료, CollectiveBuilder 통합 미완 |
+
+### BTankut GB10 MoE Triton config 시도
+
+[BTankut/dgx-spark-sglang-moe-configs](https://github.com/BTankut/dgx-spark-sglang-moe-configs)의 GB10 최적 Triton config를 Nemotron MTP drafter (BF16 Unquantized MoE)에 적용.
+
+- **결과:** 39.96 tok/s (baseline 48.9 대비 -18% 악화)
+- **원인:** BTankut config는 **FP8 MoE (E=160, N=384, GLM-4.7)**용. BF16은 데이터 크기가 2배라 BLOCK_SIZE_K=256이 SMEM 초과
+- **결론:** 모델/dtype별 개별 튜닝 필요
+
+### GPT-OSS-120B 비교 벤치마크
+
+| 모델 | 아키텍처 | Random single | Random max | Real text | Peak |
+|------|---------|-------------|-----------|-----------|------|
+| **Nemotron-3-Super** | Mamba+MoE+Attn (88 layers) | 48.0 tok/s | 53.0 tok/s | 21.9 tok/s | 63.6 tok/s |
+| **GPT-OSS-120B** | Transformer (36 layers) | 101.9 tok/s | 159.4 tok/s | 34.8 tok/s | 200 tok/s |
+
+GPT-OSS가 2~3× 빠른 이유: 레이어 절반, MoE/Mamba 없음, scatter read 없음
+
+---
+
+## 12. 최종 벤치마크 결과 (모든 최적화 적용, 03-23)
+
+> 서버 구성: FlashInfer CUTLASS FP4 + StageCount<4> + alignas(128) + MTP=2 + CUDA graph full_and_piecewise + fuse_norm_quant + fuse_act_quant
+> vLLM 버전: 0.17.2rc1.dev162
+> 벤치마크: `vllm bench serve` (공식 CLI)
+
+### ShareGPT (실제 텍스트 대화)
+
+| 메트릭 | rate=1 (20 prompts) | rate=inf (50 prompts) |
+|--------|--------------------|-----------------------|
+| **Output tok/s** | **49.93** | **63.57** |
+| Total tok/s | 102.88 | 138.29 |
+| Mean TPOT | 152.65 ms | 155.58 ms |
+| P99 ITL | 628.92 ms | 599.46 ms |
+| MTP Acceptance | 52.07% | 55.51% |
+| Mean Acceptance Length | 2.04 | 2.11 |
+
+### Random Dataset (input=128, output=256)
+
+| 메트릭 | rate=1 (20 prompts) | rate=inf (50 prompts) |
+|--------|--------------------|-----------------------|
+| **Output tok/s** | **47.98** | **52.98** |
+| Total tok/s | 71.97 | 79.46 |
+| Mean TPOT | 179.18 ms | 188.67 ms |
+| P99 ITL | 399.32 ms | 400.52 ms |
+| MTP Acceptance | 15.99% | 15.93% |
+
+> Random dataset에서 MTP acceptance ~16%로 낮음 (예측 가능한 패턴 없음)
+
+### Real Text (curl, max_tokens=512)
+
+| 메트릭 | 단일 요청 | 5개 동시 |
+|--------|----------|---------|
+| **평균 tok/s** | **21.9** | — |
+| Min / Max | 20.3 / 22.9 | 10.3 / 12.2 |
+| **Aggregate tok/s** | — | **51.3** |
+
+---
+
+## 13. 요약
 
 | 메트릭 | 값 |
 |--------|-----|
-| **최적 조합** | **Marlin + MTP=2 + f&p + fusion ON** |
-| **단일 요청 (ShareGPT)** | **46.3 tok/s** |
-| **최대 throughput (ShareGPT)** | **63.3 tok/s** |
-| **TPOT** | **116.9 ms** |
+| **최적 조합** | **FlashInfer CUTLASS + StageCount<4> + MTP=2 + f&p + fusion** |
+| **ShareGPT 단일 요청** | **49.93 tok/s** |
+| **ShareGPT 최대 throughput** | **63.57 tok/s** |
+| **Real text 단일 요청** | **21.9 tok/s** |
+| **Real text 5 concurrent** | **51.3 tok/s** |
+| **TPOT** | **152.65 ms** |
+| **이전 대비 개선** | Marlin 46.3 → FC+SMEM 49.93 (+7.8%) |
+| **Baseline 대비 개선** | 12.0 → 49.93 (+316%) |
+| **최초 대비 개선** | 2.5 → 49.93 (+1897%) |
 | **전수 벤치마크** | 144개 조합 (84 OK, 60 SKIP, 0 FAIL) |
-| **Marlin vs FC 비교** | Marlin이 평균 +10~15% 빠름 |
-| **MTP 효과** | MTP=0→2로 +35~45% |
-| **적용된 패치** | 9+ 파일, 6+ SM121 버그 수정 |
+| **CUTLASS 패치** | 4개 헤더 + 1개 실험적 커널 (sm121_sync_mma_array.hpp) |
+| **런타임 패치** | 5개 파일 |
 | **참조한 외부 이슈/PR** | 30+ 건 |
 | **하드 병목** | MoE scatter bandwidth (~110 GB/s effective) |
