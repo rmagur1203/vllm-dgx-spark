@@ -603,10 +603,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
-      // SM121 (GB10): CtaShape128x128x128B maps to K=256 elements for FP4,
-      // exceeding SM121's 101KB SMEM. Only use CtaShape128x128x64B (K=128 elements).
-      // Note: CtaShape128x256x64B and CtaShape256x128x64B are not registered in the
-      // dispatch template (moe_gemm_template_dispatch_tma_ws.h) for SM120 grouped GEMM.
+      // SM121 (GB10): Only 128x128x64B fits. Larger tiles impossible:
+      //   256x128x64B: epilogue=64KB + mainloop=54KB = 118KB > 101KB (even StageCount<2>)
+      //   128x128x128B: epilogue=32KB + mainloop=72KB = 104KB > 101KB
+      //   128x256x64B: undefined symbol (kernel not instantiated in dispatcher)
+      // The epilogue stores the full output tile (M×N×bf16) in SMEM, so M=256 is
+      // physically impossible on SM121's 101KB SMEM.
       candidate_configs.push_back(
           CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
                             EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});

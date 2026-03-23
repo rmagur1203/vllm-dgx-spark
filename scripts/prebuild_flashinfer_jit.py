@@ -58,6 +58,39 @@ if cc[0] < 12:
     print("[JIT prebuild] Not SM120+, skipping")
     sys.exit(0)
 
+# Apply CUTLASS SMEM alignment optimization patches
+# (reduces alignas(1024)→alignas(128), fixes static_assert for SM120 SMEM)
+try:
+    CUTLASS_DIR = "/usr/local/lib/python3.12/dist-packages/flashinfer/data/cutlass/include/cutlass"
+    _patched = 0
+    for fname in ["gemm/collective/sm120_blockscaled_mma_array_tma.hpp",
+                   "gemm/collective/sm120_blockscaled_mma_tma.hpp"]:
+        fpath = f"{CUTLASS_DIR}/{fname}"
+        if os.path.exists(fpath):
+            c = open(fpath).read()
+            if "alignas(1024)" in c:
+                open(fpath, 'w').write(c.replace("alignas(1024)", "alignas(128)"))
+                _patched += 1
+    # Fix static_assert to use sm120 SMEM capacity instead of sm100
+    sa_file = f"{CUTLASS_DIR}/gemm/kernel/sm103_blockscaled_gemm_array_tma_warpspecialized.hpp"
+    if os.path.exists(sa_file):
+        c = open(sa_file).read()
+        old_sa = "static_assert(SharedStorageSize <= cutlass::arch::sm100_smem_capacity_bytes"
+        new_sa = "static_assert(SharedStorageSize <= cutlass::arch::sm120_smem_capacity_bytes"
+        if old_sa in c:
+            open(sa_file, 'w').write(c.replace(old_sa, new_sa))
+            _patched += 1
+    if _patched:
+        print(f"[JIT prebuild] Applied {_patched} CUTLASS SMEM alignment patches")
+        # Force JIT rebuild when patches applied
+        if marker_file.exists():
+            marker_file.unlink()
+            for fused_moe_cache in glob.glob(os.path.expanduser("~/.cache/flashinfer/*/121a/cached_ops/fused_moe_120")):
+                shutil.rmtree(fused_moe_cache)
+                print(f"[JIT prebuild] Cleared MoE cache for rebuild with new patches")
+except Exception as e:
+    print(f"[JIT prebuild] CUTLASS patch warning: {e}")
+
 start = time.time()
 
 # 1. FP4 GEMM CUTLASS SM120

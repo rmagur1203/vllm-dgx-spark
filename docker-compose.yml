@@ -1,33 +1,16 @@
 services:
-  # ---------------------------------------------------------------
-  # Page cache 해제 + THP 활성화 (vLLM 시작 전 실행)
-  # DGX Spark 통합 메모리에서 cudaMemGetInfo가 정확한 free 메모리를
-  # 보고하도록 OS page cache를 해제합니다.
-  # ---------------------------------------------------------------
   drop-caches:
     image: alpine
     privileged: true
     pid: host
-    entrypoint:
-      - sh
-      - -c
-      - |
-        sync
-        echo 3 > /proc/sys/vm/drop_caches
-        echo 'Page cache dropped'
-        echo always > /sys/kernel/mm/transparent_hugepage/enabled
-        echo always > /sys/kernel/mm/transparent_hugepage/defrag
-        echo 'THP enabled (always)'
+    entrypoint: ["sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches && echo 'Page cache dropped'"]
 
-  # ---------------------------------------------------------------
-  # Nemotron-3-Super-120B-A12B-NVFP4 on DGX Spark (SM121)
-  # ---------------------------------------------------------------
   nemotron-3-super:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: vllm-dgx-spark:latest
-    container_name: vllm-nemotron-3-super
+      dockerfile: vllm.Dockerfile
+    image: vllm:latest
+    container_name: vllm-nemotron-3-super-120b-a12b-nvfp4
     depends_on:
       drop-caches:
         condition: service_completed_successfully
@@ -44,80 +27,55 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
-
     environment:
-      # --- FlashInfer JIT ---
+      TORCHINDUCTOR_COMPILE_THREADS: "1"
+      MAX_JOBS: "2"
       FLASHINFER_CUDA_ARCH_LIST: "12.1a"
       FLASHINFER_DISABLE_VERSION_CHECK: "1"
       FLASHINFER_EXTRA_CUDAFLAGS: "-DCUTLASS_ENABLE_GDC_FOR_SM100=1"
-
-      # --- vLLM backend selection ---
       VLLM_KV_CACHE_LAYOUT: "HND"
       VLLM_NVFP4_GEMM_BACKEND: "flashinfer-cutlass"
       VLLM_USE_FLASHINFER_MOE_FP4: "1"
-
-      # --- Build parallelism ---
-      TORCHINDUCTOR_COMPILE_THREADS: "1"
-      MAX_JOBS: "2"
-
-      # --- HuggingFace ---
       HF_HOME: "/root/.cache/huggingface"
-
     volumes:
-      # Persistent caches (survive container recreation)
-      - ./cache:/root/.cache
-
-      # Runtime patches (volume-mounted to avoid image rebuild)
+      # Model/cache storage
+      - ./hf-cache:/root/.cache
+      # Scripts
+      - ./scripts/prebuild_flashinfer_jit.py:/workspace/prebuild_flashinfer_jit.py:ro
+      - ./scripts/super_v3_reasoning_parser.py:/workspace/super_v3_reasoning_parser.py:ro
+      # Runtime patches (vLLM + FlashInfer)
       - ./patches/runtime/tvm_build_patch.py:/usr/local/lib/python3.12/dist-packages/tvm_ffi/utils/_build_optional_torch_c_dlpack.py:ro
       - ./patches/runtime/cutlass_heuristic_patch.cpp:/usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp:ro
       - ./patches/runtime/vllm_flashinfer_utils_patch.py:/usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py:ro
       - ./patches/runtime/flashinfer_backend_patch.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/flashinfer.py:ro
       - ./patches/runtime/mamba_mixer2_patch.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/mamba_mixer2.py:ro
-
-      # Scripts
-      - ./scripts/prebuild_flashinfer_jit.py:/workspace/prebuild_flashinfer_jit.py:ro
-      - ./scripts/super_v3_reasoning_parser.py:/workspace/super_v3_reasoning_parser.py:ro
-
-    entrypoint:
-      - bash
-      - -c
-      - "python3 /workspace/prebuild_flashinfer_jit.py && exec python3 -m vllm.entrypoints.openai.api_server \"$@\""
-      - "--"
-
+      # CUTLASS SMEM optimization patches (alignas(128), StageCount<4>, static_assert sm120)
+      - ./patches/cutlass/moe_gemm_tma_ws_launcher_patch.inl:/usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl:ro
+      - ./patches/cutlass/sm120_blockscaled_mma_array_tma.hpp:/usr/local/lib/python3.12/dist-packages/flashinfer/data/cutlass/include/cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp:ro
+      - ./patches/cutlass/sm120_blockscaled_mma_builder.inl:/usr/local/lib/python3.12/dist-packages/flashinfer/data/cutlass/include/cutlass/gemm/collective/builders/sm120_blockscaled_mma_builder.inl:ro
+      - ./patches/cutlass/sm103_blockscaled_gemm_array_tma_warpspecialized.hpp:/usr/local/lib/python3.12/dist-packages/flashinfer/data/cutlass/include/cutlass/gemm/kernel/sm103_blockscaled_gemm_array_tma_warpspecialized.hpp:ro
+    entrypoint: ["bash", "-c", "python3 /workspace/prebuild_flashinfer_jit.py && exec python3 -m vllm.entrypoints.openai.api_server \"$$@\"", "--"]
     command:
-      # --- Model ---
       - --model=nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
-      - --served-model-name=nemotron-3-super
+      - --served-model-name=vllm/nemotron-3-super-120b
       - --trust-remote-code
-
-      # --- Server ---
-      - --host=0.0.0.0
-      - --port=8000
-      - --api-key=${VLLM_API_KEY:-changeme}
-
-      # --- Reasoning / Tool calling ---
+      - --enable-sleep-mode
+      - --tool-call-parser=qwen3_coder
       - --reasoning-parser-plugin=/workspace/super_v3_reasoning_parser.py
       - --reasoning-parser=super_v3
-      - --tool-call-parser=qwen3_coder
       - --enable-auto-tool-choice
-
-      # --- Performance ---
+      - --host=0.0.0.0
+      - --port=8000
       - --tensor-parallel-size=1
       - --enable-chunked-prefill
       - --max-model-len=131072
-      - --attention-backend=FLASHINFER
       - --enable-prefix-caching
       - --mamba-cache-mode=align
-      - --max-num-batched-tokens=8400
       - --load-format=fastsafetensors
       - --gpu-memory-utilization=0.8
-      - --enable-sleep-mode
-
-      # --- SM121-specific flags ---
       - --attention-config={"disable_flashinfer_q_quantization":true}
-
-      # --- Compilation & CUDA graphs ---
+      - --attention-backend=FLASHINFER
+      - --max-num-batched-tokens=8400
       - --compilation-config={"cudagraph_mode":"full_and_piecewise","pass_config":{"fuse_norm_quant":true,"fuse_act_quant":true}}
-
-      # --- MTP speculative decoding ---
       - --speculative-config={"method":"mtp","num_speculative_tokens":2}
+      - --api-key=${VLLM_API_KEY}
