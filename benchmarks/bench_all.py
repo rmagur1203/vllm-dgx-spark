@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 Exhaustive benchmark: 144 config combinations for Nemotron-3-Super-120B on DGX Spark.
@@ -8,7 +9,7 @@ Ref: https://docs.vllm.ai/en/latest/benchmarking/cli/#online-benchmark
 """
 import itertools, json, os, subprocess, sys, time
 
-API_KEY = "${VLLM_API_KEY}"
+API_KEY = os.environ.get("VLLM_API_KEY", "changeme")
 CONTAINER = "vllm-nemotron-3-super-120b-a12b-nvfp4"
 TOKENIZER = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
 RESULTS = "/home/user/vllm/bench_results.jsonl"
