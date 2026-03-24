@@ -115,7 +115,7 @@ RUN cd 3rdparty/cutlass && \
 # - K=64 CTA shapes in generate_kernels.py
 # Reference: https://github.com/flashinfer-ai/flashinfer/pull/2786
 #            https://github.com/NVIDIA/cutlass/issues/3096
-COPY flashinfer_k64_sm120_v442.patch .
+COPY patches/build/flashinfer_k64_sm120_v442.patch .
 RUN patch -p1 < flashinfer_k64_sm120_v442.patch
 
 # Remove K=128 large tiles that don't fit SM121's 101KB SMEM (Stages=1 → static_assert fail).
@@ -155,7 +155,7 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
 # Apply E2M1 SM121 fix: remove SM121 from CUDA_PTX_FP4FP6_CVT_ENABLED
 # SM121 (GB10) lacks cvt.rn.satfinite.e2m1x2.f32 PTX instruction
 # Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
-COPY flashinfer_e2m1_sm121.patch .
+COPY patches/build/flashinfer_e2m1_sm121.patch .
 RUN if [ -f flashinfer_e2m1_sm121.patch ]; then \
         if patch -p1 --dry-run --reverse < flashinfer_e2m1_sm121.patch &>/dev/null; then \
             echo "E2M1 SM121 CUTLASS patch already applied"; \
@@ -173,7 +173,7 @@ RUN if [ -f flashinfer_e2m1_sm121.patch ]; then \
 # fp32_vec_to_e2m1 which has the software fallback. Excluding SM121 from
 # the wrappers causes them to return 0 with uninitialized scale factors → NaN.
 # Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
-COPY fix_quantization_utils_sm121.py .
+COPY patches/build/fix_quantization_utils_sm121.py .
 RUN python3 fix_quantization_utils_sm121.py
 
 # Patch CuTe DSL admissible_archs: add SM120/SM121 so MoE JIT can compile for GB10
@@ -199,7 +199,7 @@ RUN if grep -q 'kMinComputeCapability == 100' \
     fi
 
 # Apply patch to avoid re-downloading existing cubins
-COPY flashinfer_cache.patch .
+COPY patches/build/flashinfer_cache.patch .
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=cubins-cache,target=/workspace/flashinfer/flashinfer-cubin/flashinfer_cubin/cubins \
@@ -356,7 +356,7 @@ RUN sed -i 's/set(CUDA_SUPPORTED_ARCHS "7.5;8.0;8.6;8.7;8.9;9.0;10.0;11.0;12.0")
 # Apply E2M1 software conversion for SM121 (GB10) - enables CUDA graphs with NVFP4
 # SM121 lacks cvt.rn.satfinite.e2m1x2.f32 PTX; this adds a software fallback
 # Reference: https://github.com/Avarok-Cybersecurity/dgx-vllm
-COPY e2m1_nvfp4_sm121.patch .
+COPY patches/build/e2m1_nvfp4_sm121.patch .
 RUN if [ -f e2m1_nvfp4_sm121.patch ]; then \
         if patch -p1 --dry-run --reverse < e2m1_nvfp4_sm121.patch &>/dev/null; then \
             echo "E2M1 NVFP4 SM121 patch already applied"; \
