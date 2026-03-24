@@ -8,7 +8,7 @@ services:
   nemotron-3-super:
     build:
       context: .
-      dockerfile: vllm.Dockerfile
+      dockerfile: Dockerfile
     image: vllm:latest
     container_name: vllm-nemotron-3-super-120b-a12b-nvfp4
     depends_on:

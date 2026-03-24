@@ -19,9 +19,19 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
+try:
+    from vllm.model_executor.layers.batch_invariant import (
+        vllm_is_batch_invariant,
+    )
+except ImportError:
+    # vLLM 0.18+ renamed vllm_is_batch_invariant → addmm_batch_invariant
+    try:
+        from vllm.model_executor.layers.batch_invariant import (
+            addmm_batch_invariant as vllm_is_batch_invariant,
+        )
+    except ImportError:
+        def vllm_is_batch_invariant():
+            return False
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
