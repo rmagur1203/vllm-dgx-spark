@@ -237,8 +237,8 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
-# Pin to the commit we tested against. Use --build-arg VLLM_REF=main for latest.
-ARG VLLM_REF=ed359c497
+# Pin to 0.18.1rc1.dev20 (2026-03-22). Use --build-arg VLLM_REF=main for latest.
+ARG VLLM_REF=b3e846017
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
